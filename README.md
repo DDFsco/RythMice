@@ -114,6 +114,10 @@ python -m src.analysis.analyze_treadmill_wheel --input path/to/recording.dat --o
 
 ### Interactive GUI (tune thresholds and refresh plots)
 
+The treadmill / wheel analyzer GUI provides live QC: browse to a `.dat` file, adjust detection and bout parameters, then **Run analysis / refresh plots** to update the five-panel dashboard. Summary stats (events, valid/micro bouts, valid run time, mean/median speed) appear in the sidebar; use **Save full outputs to folder…** for the same exports as the CLI.
+
+![Treadmill / wheel analyzer GUI – live QC (voltage, speed, event QC, bout histograms)](GUI_interface.png)
+
 From the repo root:
 
 ```bash
@@ -132,7 +136,7 @@ Or call the interpreter explicitly, for example:
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m src.analysis.treadmill_wheel_gui
 ```
 
-Browse to a `.dat` file, edit parameters (thresholds, bout rules, etc.), click **Run analysis / refresh plots**. The five-panel figure updates after each run (large traces are decimated for speed; full-resolution exports use **Save full outputs to folder…**, which calls the same pipeline as the CLI).
+Large traces are decimated in the GUI for responsiveness; full-resolution CSV/JSON and figures use **Save full outputs to folder…** (same pipeline as the CLI).
 
 ### Input file format
 
