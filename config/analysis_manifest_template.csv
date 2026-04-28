@@ -1,0 +1,5 @@
+mouse_id,session_id,condition,data_file
+M01,s01,no_click,data/raw/M01_s01_no_click.dat
+M01,s02,click,data/raw/M01_s02_click.dat
+M02,s01,no_click,data/raw/M02_s01_no_click.dat
+M02,s02,click,data/raw/M02_s02_click.dat

@@ -1,0 +1,11 @@
+{
+  "session_id": "session_001",
+  "baseline_silence_s": 1200,
+  "stim_on_s": 120,
+  "stim_off_s": 300,
+  "post_silence_s": 600,
+  "tempo_subset_hz": [2, 6, 8, 12],
+  "include_random_controls": true,
+  "max_stimuli_in_session": 8,
+  "random_seed": 7
+}
