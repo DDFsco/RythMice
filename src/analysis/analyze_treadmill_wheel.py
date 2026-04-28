@@ -20,6 +20,7 @@ from typing import Any, Literal, Optional
 import numpy as np
 from matplotlib.figure import Figure
 import pandas as pd
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, medfilt, savgol_filter
 
 
@@ -49,12 +50,12 @@ class WheelAnalysisConfig:
     peak_prominence: float = 0.5
     peak_distance_samples: int = 10
 
-    # Speed trace: sliding windows on event times (continuous grid; works with irregular DAQ sampling)
-    speed_window_s: float = 0.2
-    speed_step_s: float = 0.1
-    movement_threshold_deg_s: float = 120.0
-    # Moving average of windowed speed for plots only (seconds); 0 = disabled. Not used for bouts/thresholds.
-    speed_visual_smooth_s: float = 0.0
+    # Speed = event rate (counts/s on a uniform grid) × degrees_per_event, after Gaussian smoothing.
+    # Raw voltage is not interpolated; only event timestamps are binned.
+    speed_grid_hz: int = 100  # uniform binning grid: 100 or 1000
+    sigma_analysis_s: float = 0.5  # Gaussian σ (s) on event-rate train for bouts / threshold / stats
+    sigma_visualization_s: float = 1.0  # Gaussian σ (s) on event-rate train for plotting (typically ≥ analysis)
+    movement_threshold_deg_s: float = 80.0
 
     # Bout rules
     min_valid_duration_s: float = 2.0
@@ -391,59 +392,68 @@ def compute_speed_trace(
     cfg: WheelAnalysisConfig,
 ) -> dict[str, np.ndarray]:
     """
-    Continuous locomotor speed from overlapping sliding windows on absolute time.
+    Continuous locomotor speed from **event counts** on a uniform time grid (no voltage interpolation).
 
-    For each window center, count wheel events with times in [center - W/2, center + W/2],
-    then speed = (n_events * degrees_per_event) / W. This is independent of DAQ sample spacing;
-    only event timestamps matter. Grid is uniform in time (step S); overlapping windows give a
-    smooth series suitable for bout detection (not per-event impulses).
-
-    Also computes optional ``speed_deg_s_smooth_vis``: moving average over window centers for
-    visualization only (does not affect active_mask or bout logic).
+    1. Histogram encoder events onto bins of width ``1 / speed_grid_hz``.
+    2. ``event_rate = count / bin_width`` (events/s).
+    3. Gaussian smoothing on the rate train with σ = ``sigma_analysis_s`` and σ = ``sigma_visualization_s``
+       (seconds → scipy ``gaussian_filter1d`` in sample units).
+    4. ``speed_deg_s = smoothed_rate_analysis * degrees_per_event`` (bouts, threshold, CSV primary speed).
+       ``speed_deg_s_smooth_vis`` uses ``sigma_visualization_s``.
     """
     t = np.asarray(timestamp_s, dtype=float)
     ev = np.asarray(event_times_s, dtype=float)
     ev = np.sort(ev)
 
+    hz = int(cfg.speed_grid_hz)
+    if hz not in (100, 1000):
+        raise ValueError("speed_grid_hz must be 100 or 1000.")
+    bin_width = 1.0 / float(hz)
+
     t0_session = float(t[0])
     t1_session = float(t[-1])
-    win = float(cfg.speed_window_s)
-    half = win / 2.0
-    step = float(cfg.speed_step_s)
-    if step <= 0 or half <= 0:
-        raise ValueError("speed_window_s and speed_step_s must be positive.")
+    duration = max(t1_session - t0_session, bin_width)
+    n_bins = max(1, int(np.ceil(duration / bin_width)))
+    edges = t0_session + np.arange(n_bins + 1, dtype=float) * bin_width
+    centers = (edges[:-1] + edges[1:]) / 2.0
 
-    centers = np.arange(t0_session + half, t1_session - half + 1e-9, step, dtype=float)
-    if len(centers) == 0:
-        centers = np.array([t0_session + (t1_session - t0_session) / 2.0])
+    counts, _ = np.histogram(ev, bins=edges)
+    counts_f = counts.astype(float)
+    event_rate_raw = counts_f / bin_width
+
+    sigma_a = float(cfg.sigma_analysis_s)
+    sigma_v = float(cfg.sigma_visualization_s)
+    if sigma_a <= 0 or sigma_v <= 0:
+        raise ValueError("sigma_analysis_s and sigma_visualization_s must be positive.")
+
+    sigma_samples_a = sigma_a / bin_width
+    sigma_samples_v = sigma_v / bin_width
+    rate_gauss_a = gaussian_filter1d(event_rate_raw, sigma=float(sigma_samples_a), mode="nearest")
+    rate_gauss_v = gaussian_filter1d(event_rate_raw, sigma=float(sigma_samples_v), mode="nearest")
 
     deg_per_evt = float(cfg.degrees_per_event)
-    left = centers - half
-    right = centers + half
-    n_evts = np.searchsorted(ev, right, side="left") - np.searchsorted(ev, left, side="left")
-    n_evts = n_evts.astype(float)
-    deg_s = (n_evts * deg_per_evt) / win
-    rev_s = deg_s / 360.0
+    speed_deg_s = rate_gauss_a * deg_per_evt
+    speed_deg_vis = rate_gauss_v * deg_per_evt
+    rev_s = speed_deg_s / 360.0
 
-    active = deg_s > float(cfg.movement_threshold_deg_s)
-
-    smooth_s = float(cfg.speed_visual_smooth_s)
-    smooth_vis: Optional[np.ndarray] = None
-    if smooth_s > 0 and len(deg_s) > 0:
-        k = max(1, int(math.ceil(smooth_s / step)))
-        ker = np.ones(k, dtype=float) / float(k)
-        smooth_vis = np.convolve(deg_s, ker, mode="same")
+    active = speed_deg_s > float(cfg.movement_threshold_deg_s)
+    half = bin_width / 2.0
 
     out: dict[str, Any] = {
         "window_center_s": centers,
         "window_halfwidth_s": np.full_like(centers, half),
-        "event_count_in_window": n_evts.astype(int),
-        "speed_deg_s": deg_s,
+        "bin_edges_s": edges,
+        "bin_width_s": bin_width,
+        "speed_grid_hz": float(hz),
+        "event_count_per_bin": counts.astype(np.int64),
+        "event_rate_per_s_raw": event_rate_raw,
+        "event_rate_per_s_gaussian_analysis": rate_gauss_a,
+        "event_rate_per_s_gaussian_viz": rate_gauss_v,
+        "speed_deg_s": speed_deg_s,
+        "speed_deg_s_smooth_vis": speed_deg_vis,
         "speed_rev_s": rev_s,
         "active_mask": active,
     }
-    if smooth_vis is not None:
-        out["speed_deg_s_smooth_vis"] = smooth_vis
     return out
 
 
@@ -651,6 +661,11 @@ def build_time_series_table(
     sv = speed.get("speed_deg_s_smooth_vis")
     if sv is not None and len(sv) == len(wc):
         row["speed_deg_s_smooth_vis"] = sv
+    if "event_count_per_bin" in speed and len(speed["event_count_per_bin"]) == len(wc):
+        row["event_count_per_bin"] = speed["event_count_per_bin"]
+        row["event_rate_per_s_raw"] = speed["event_rate_per_s_raw"]
+        row["event_rate_per_s_gaussian_analysis"] = speed["event_rate_per_s_gaussian_analysis"]
+        row["event_rate_per_s_gaussian_viz"] = speed["event_rate_per_s_gaussian_viz"]
     return pd.DataFrame(row)
 
 
@@ -763,28 +778,24 @@ def plot_figure2_speed_trace(
     out_path: Path,
     title: str = "Speed trace",
     movement_threshold_deg_s: Optional[float] = None,
+    sigma_analysis_s: Optional[float] = None,
+    sigma_visualization_s: Optional[float] = None,
 ) -> None:
     fig = Figure(figsize=(12, 3.5))
     ax = fig.subplots()
     wc = speed["window_center_s"]
-    ax.plot(
-        wc,
-        speed["speed_deg_s"],
-        color="C0",
-        lw=1.1,
-        label="Speed (deg/s), sliding window",
-    )
+    sa = float(sigma_analysis_s) if sigma_analysis_s is not None else None
+    sv_sig = float(sigma_visualization_s) if sigma_visualization_s is not None else None
+    lbl_a = "Speed (deg/s), σ_analysis"
+    if sa is not None:
+        lbl_a = f"Speed (deg/s), σ_an={sa:g}s"
+    ax.plot(wc, speed["speed_deg_s"], color="C0", lw=1.1, label=lbl_a)
     sv = speed.get("speed_deg_s_smooth_vis")
     if sv is not None and len(sv) == len(wc):
-        ax.plot(
-            wc,
-            sv,
-            color="C1",
-            lw=1.0,
-            ls="--",
-            alpha=0.85,
-            label="Smoothed (viz only)",
-        )
+        lbl_v = "Speed (deg/s), σ_viz"
+        if sv_sig is not None:
+            lbl_v = f"Speed (deg/s), σ_viz={sv_sig:g}s"
+        ax.plot(wc, sv, color="C1", lw=1.0, ls="--", alpha=0.85, label=lbl_v)
     if movement_threshold_deg_s is not None:
         ax.axhline(
             float(movement_threshold_deg_s),
@@ -795,7 +806,7 @@ def plot_figure2_speed_trace(
         )
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("deg/s")
-    ax.set_title(title + " | continuous windowed speed")
+    ax.set_title(title + " | event-rate Gaussian → deg/s")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -942,10 +953,17 @@ def plot_debug_time_window(
 
     wc = speed["window_center_s"]
     sm = (wc >= t_start) & (wc <= t_end)
-    ax_s.plot(wc[sm], speed["speed_deg_s"][sm], color="C0", lw=1.1, label="Speed (windowed)")
+    ax_s.plot(
+        wc[sm],
+        speed["speed_deg_s"][sm],
+        color="C0",
+        lw=1.1,
+        label=f"Speed σ_an={float(cfg.sigma_analysis_s):g}s",
+    )
     sv = speed.get("speed_deg_s_smooth_vis")
     if sv is not None and len(sv) == len(wc):
-        ax_s.plot(wc[sm], sv[sm], color="C1", lw=1.0, ls="--", alpha=0.85, label="Smoothed (viz)")
+        sv_lbl = f"Speed σ_viz={float(cfg.sigma_visualization_s):g}s"
+        ax_s.plot(wc[sm], sv[sm], color="C1", lw=1.0, ls="--", alpha=0.85, label=sv_lbl)
     ax_s.axhline(cfg.movement_threshold_deg_s, color="0.5", ls=":", lw=0.9, label=f"Move thr={cfg.movement_threshold_deg_s}")
     ax_s.set_ylabel("deg/s")
     ax_s.set_xlabel("Time (s)")
@@ -1080,6 +1098,8 @@ def run_pipeline(
         outdir / f"{stem}_fig2_speed.png",
         title=stem,
         movement_threshold_deg_s=float(cfg.movement_threshold_deg_s),
+        sigma_analysis_s=float(cfg.sigma_analysis_s),
+        sigma_visualization_s=float(cfg.sigma_visualization_s),
     )
     plot_figure3_event_qc(t, pre["processed_voltage"], events, outdir / f"{stem}_fig3_events.png", title=stem)
     plot_figure4_bout_distributions(bouts_df, outdir / f"{stem}_fig4_bout_hist.png", title=stem)
@@ -1150,24 +1170,25 @@ def main() -> None:
     parser.add_argument("--peak-distance-samples", type=int, default=10)
 
     parser.add_argument(
-        "--speed-window-s",
-        type=float,
-        default=0.2,
-        help="Sliding window width (s) for continuous speed: displacement / this duration.",
+        "--speed-grid-hz",
+        type=int,
+        choices=[100, 1000],
+        default=100,
+        help="Uniform time-bin frequency for event counting (Hz): 100 or 1000.",
     )
     parser.add_argument(
-        "--speed-step-s",
+        "--sigma-analysis-s",
         type=float,
-        default=0.1,
-        help="Step between window centers (s); overlapping windows if step < window.",
+        default=0.5,
+        help="Gaussian σ (seconds) on event-rate train for bouts / threshold / exported primary speed.",
     )
     parser.add_argument(
-        "--speed-visual-smooth-s",
+        "--sigma-visualization-s",
         type=float,
-        default=0.0,
-        help="Moving average of windowed speed for plots/CSV only (s); 0 disables.",
+        default=1.0,
+        help="Gaussian σ (seconds) on event-rate train for visualization curve.",
     )
-    parser.add_argument("--movement-threshold-deg-s", type=float, default=120.0)
+    parser.add_argument("--movement-threshold-deg-s", type=float, default=80.0)
 
     parser.add_argument("--min-valid-duration-s", type=float, default=2.0)
     parser.add_argument("--min-valid-events", type=int, default=5)
@@ -1231,9 +1252,9 @@ def main() -> None:
         threshold_low=args.threshold_low,
         peak_prominence=args.peak_prominence,
         peak_distance_samples=args.peak_distance_samples,
-        speed_window_s=args.speed_window_s,
-        speed_step_s=args.speed_step_s,
-        speed_visual_smooth_s=args.speed_visual_smooth_s,
+        speed_grid_hz=args.speed_grid_hz,
+        sigma_analysis_s=args.sigma_analysis_s,
+        sigma_visualization_s=args.sigma_visualization_s,
         movement_threshold_deg_s=args.movement_threshold_deg_s,
         min_valid_duration_s=args.min_valid_duration_s,
         min_valid_events=args.min_valid_events,

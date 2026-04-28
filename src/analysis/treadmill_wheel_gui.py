@@ -77,23 +77,21 @@ PARAM_HELP: dict[str, str] = {
         "Change: increase if one rotation produces multiple peaks; decrease if peaks are "
         "merged and under-counted."
     ),
-    "speed_window_s": (
-        "Width (seconds) of the sliding window used to count events and convert to "
-        "deg/s. Wider → smoother speed, more events per window.\n\n"
-        "Change: widen (~0.2 s) if speed flickers between zero and high inside a real "
-        "run; narrow if you need sharper time resolution."
+    "speed_grid_hz": (
+        "Uniform sampling grid for counting encoder events (Hz): **100** (10 ms bins) or **1000** "
+        "(1 ms bins). Events are **binned** into each interval (no interpolation of voltage).\n\n"
+        "Change: use 1000 Hz only if you need finer resolution at the cost of larger CSVs."
     ),
-    "speed_step_s": (
-        "Step between consecutive speed window centers (seconds). Smaller → more "
-        "points on the speed trace.\n\n"
-        "Change: default 0.1 s with 0.2 s window gives overlapping windows and a "
-        "continuous speed curve; reduce for finer time grid (slower)."
+    "sigma_analysis_s": (
+        "Gaussian σ (seconds) applied to the **event-rate train** (counts/bin ÷ bin width). "
+        "The σ_analysis curve drives bout detection, movement threshold, and exported "
+        "**speed_deg_s**.\n\n"
+        "Typical ~0.5 s."
     ),
-    "speed_visual_smooth_s": (
-        "Extra moving average applied to the windowed speed for plots and CSV column "
-        "speed_deg_s_smooth_vis only. Does NOT affect bout detection or movement "
-        "threshold (those use the raw windowed speed).\n\n"
-        "Change: set to 0 to disable; increase for a softer line on Fig 2."
+    "sigma_visualization_s": (
+        "Gaussian σ (seconds) on the same event-rate train for the dashed speed curve "
+        "(column **speed_deg_s_smooth_vis**). Usually slightly wider than σ_analysis for figures.\n\n"
+        "Typical ~1 s."
     ),
     "movement_threshold_deg_s": (
         "Local speed above this marks the window as “active” for bout building.\n\n"
@@ -233,6 +231,12 @@ def _config_from_vars(vars_dict: dict[str, Any]) -> WheelAnalysisConfig:
     tu = vars_dict["time_unit"].get().strip().lower()
     if tu not in ("auto", "s", "ms"):
         tu = "auto"
+    try:
+        sgh = int(float(vars_dict["speed_grid_hz"].get()))
+    except ValueError:
+        sgh = 100
+    if sgh not in (100, 1000):
+        sgh = 100
     return WheelAnalysisConfig(
         degrees_per_event=float(vars_dict["degrees_per_event"].get()),
         smoothing_method="moving_average",
@@ -242,9 +246,9 @@ def _config_from_vars(vars_dict: dict[str, Any]) -> WheelAnalysisConfig:
         threshold_low=float(vars_dict["threshold_low"].get()),
         peak_prominence=float(vars_dict["peak_prominence"].get()),
         peak_distance_samples=int(float(vars_dict["peak_distance_samples"].get())),
-        speed_window_s=float(vars_dict["speed_window_s"].get()),
-        speed_step_s=float(vars_dict["speed_step_s"].get()),
-        speed_visual_smooth_s=float(vars_dict["speed_visual_smooth_s"].get()),
+        speed_grid_hz=sgh,
+        sigma_analysis_s=float(vars_dict["sigma_analysis_s"].get()),
+        sigma_visualization_s=float(vars_dict["sigma_visualization_s"].get()),
         movement_threshold_deg_s=float(vars_dict["movement_threshold_deg_s"].get()),
         min_valid_duration_s=float(vars_dict["min_valid_duration_s"].get()),
         min_valid_events=int(float(vars_dict["min_valid_events"].get())),
@@ -296,10 +300,10 @@ class TreadmillWheelGui:
             "threshold_low": tk.StringVar(value="1.5"),
             "peak_prominence": tk.StringVar(value="0.5"),
             "peak_distance_samples": tk.StringVar(value="10"),
-            "speed_window_s": tk.StringVar(value="0.2"),
-            "speed_step_s": tk.StringVar(value="0.1"),
-            "speed_visual_smooth_s": tk.StringVar(value="0"),
-            "movement_threshold_deg_s": tk.StringVar(value="120"),
+            "speed_grid_hz": tk.StringVar(value="100"),
+            "sigma_analysis_s": tk.StringVar(value="0.5"),
+            "sigma_visualization_s": tk.StringVar(value="1.0"),
+            "movement_threshold_deg_s": tk.StringVar(value="80"),
             "merge_gap_s": tk.StringVar(value="2"),
             "min_valid_duration_s": tk.StringVar(value="2.0"),
             "min_valid_events": tk.StringVar(value="5"),
@@ -406,11 +410,22 @@ class TreadmillWheelGui:
         r += 1
         _row(r, "peak_distance_samples", "peak_distance_samples")
         r += 1
-        _row(r, "speed_window_s", "speed_window_s")
+        lbl_sg = ttk.Label(inner, text="Speed grid (Hz)")
+        lbl_sg.grid(row=r, column=0, sticky="w", padx=4, pady=2)
+        cb_sg = ttk.Combobox(
+            inner,
+            textvariable=self.vars["speed_grid_hz"],
+            values=("100", "1000"),
+            state="readonly",
+            width=12,
+        )
+        cb_sg.grid(row=r, column=1, sticky="e", padx=4, pady=2)
+        ToolTip(lbl_sg, PARAM_HELP["speed_grid_hz"])
+        ToolTip(cb_sg, PARAM_HELP["speed_grid_hz"])
         r += 1
-        _row(r, "speed_step_s", "speed_step_s")
+        _row(r, "sigma_analysis (s)", "sigma_analysis_s")
         r += 1
-        _row(r, "speed_smooth_vis (s, 0=off)", "speed_visual_smooth_s")
+        _row(r, "sigma_visualization (s)", "sigma_visualization_s")
         r += 1
         _row(r, "movement_threshold (deg/s)", "movement_threshold_deg_s")
         r += 1
@@ -710,6 +725,8 @@ class TreadmillWheelGui:
             if tu not in ("auto", "s", "ms"):
                 tu = "auto"
             cfg.time_unit = tu  # type: ignore[assignment]
+            if cfg.sigma_analysis_s <= 0 or cfg.sigma_visualization_s <= 0:
+                raise ValueError("sigma_analysis_s and sigma_visualization_s must be positive.")
         except (ValueError, OSError) as e:
             messagebox.showerror("Invalid input", str(e))
             return
@@ -819,14 +836,28 @@ class TreadmillWheelGui:
             ax.set_title("Voltage + bouts (green=valid, orange=micro)")
             ax.legend(loc="upper right", fontsize=7)
 
-            # Fig 2 — continuous windowed speed (+ optional viz-only smooth)
+            # Fig 2 — event-rate bins → Gaussian σ_analysis / σ_viz → deg/s
             ax = self.ax2
             ax.clear()
             wc = speed["window_center_s"] - t0
-            ax.plot(wc, speed["speed_deg_s"], color="C0", lw=1.0, label="Speed (sliding window)")
+            ax.plot(
+                wc,
+                speed["speed_deg_s"],
+                color="C0",
+                lw=1.0,
+                label=f"Speed σ_an={float(cfg.sigma_analysis_s):g}s",
+            )
             sv = speed.get("speed_deg_s_smooth_vis")
             if sv is not None and len(sv) == len(wc):
-                ax.plot(wc, sv, color="C1", lw=0.95, ls="--", alpha=0.85, label="Smoothed (viz only)")
+                ax.plot(
+                    wc,
+                    sv,
+                    color="C1",
+                    lw=0.95,
+                    ls="--",
+                    alpha=0.85,
+                    label=f"Speed σ_viz={float(cfg.sigma_visualization_s):g}s",
+                )
             ax.axhline(
                 float(cfg.movement_threshold_deg_s),
                 color="0.45",
@@ -836,7 +867,7 @@ class TreadmillWheelGui:
             )
             ax.set_xlabel("Time (s) from start")
             ax.set_ylabel("deg/s")
-            ax.set_title("Speed (continuous windowed)")
+            ax.set_title("Speed (event rate × deg/event, Gaussian)")
             ax.legend(loc="upper right", fontsize=7)
 
             # Fig 3

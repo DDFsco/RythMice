@@ -80,7 +80,24 @@ If you will record with LabJack tools and run audio in MATLAB:
 
 ## Treadmill / wheel `.dat` analysis (events, bouts, speed)
 
-Use `src/analysis/analyze_treadmill_wheel.py` when LabJack (or similar) logs **timestamp + voltage** and you need **wheel events**, **running speed (deg/s and rev/s)**, **running bouts** (valid vs micro), and QC figures. Bouts are driven by **local speed / event rate**, not by thresholding raw voltage.
+Use `src/analysis/analyze_treadmill_wheel.py` when LabJack (or similar) logs **timestamp + voltage** and you need **wheel events**, **running speed (deg/s and rev/s)**, **running bouts** (valid vs micro), and QC figures. The locomotor speed pipeline is summarized below; raw voltage is **not** interpolated or resampled for speed—only **encoder event times** feed the rate estimate.
+
+### Speed estimation (implementation)
+
+Pipeline (`compute_speed_trace`):
+
+1. **Encoder events** — Event timestamps are detected from the voltage trace using the chosen hysteresis (`threshold_high` / `threshold_low`) or **peak** detection (`peak_prominence`, `peak_distance_samples`), after optional voltage smoothing (`smoothing_*`).
+2. **Uniform time grid** — The recording interval `[t_first, t_last]` is divided into contiguous bins of width **`1 / speed_grid_hz`** seconds. Allowed values: **`speed_grid_hz = 100`** (10 ms bins, default) or **`1000`** (1 ms bins). Bin edges align at `t_first`.
+3. **Event-count train** — Events are **binned** with `numpy.histogram` (counts per bin). No interpolation of the analog voltage onto this grid.
+4. **Instantaneous event rate** — Per bin: **`event_rate (events/s) = count_in_bin / bin_width`**.
+5. **Gaussian smoothing on the rate** — The rate vector is smoothed along time with **`scipy.ndimage.gaussian_filter1d`** (`mode="nearest"` at edges). Width **σ is specified in seconds**; internally it is converted to **samples** as `σ / bin_width`. Two independent Gaussian passes on the **same** raw rate train:
+   - **`sigma_analysis_s`** (default **0.5 s**) → `event_rate_per_s_gaussian_analysis` → primary angular speed **`speed_deg_s`** and **`speed_rev_s`**. Used for **movement threshold**, **active bouts**, **session / valid-bout statistics**, and **`speed_distribution_valid.csv`**.
+   - **`sigma_visualization_s`** (default **1.0 s**, usually ≥ analysis) → **`speed_deg_s_smooth_vis`** for a smoother trace on **Fig 2** (and the same column in exports). Does not change bout rules relative to `speed_deg_s`.
+6. **Angular speed** — **`speed_deg_s = smoothed_event_rate × degrees_per_event`** (and the same for the visualization curve).
+7. **Thresholding & bouts** — A bin is **active** when `speed_deg_s` (analysis) **>** `movement_threshold_deg_s` (default **80 deg/s**). Contiguous active regions are merged with `merge_gap_s`, then classified as valid vs micro using duration, event count, and `valid_mean_speed_deg_s`.
+8. **QC figures** — **Fig 3** shows **processed voltage + event markers** only. **Fig 2** overlays analysis speed and (by default) the wider-σ visualization speed.
+
+CLI flags: `--speed-grid-hz`, `--sigma-analysis-s`, `--sigma-visualization-s`, `--movement-threshold-deg-s`, `--degrees-per-event`. All must keep **`sigma_*` > 0**.
 
 ### Prerequisites
 
@@ -131,14 +148,15 @@ Browse to a `.dat` file, edit parameters (thresholds, bout rules, etc.), click *
 |------|-------------------|
 | Event detection (hysteresis, default) | `--threshold-high`, `--threshold-low` (volts; **high > low**) |
 | Event detection (peaks) | `--event-method peak`, `--peak-prominence`, `--peak-distance-samples` |
-| Smoothing | `--smoothing moving_average\|savgol\|none`, `--smoothing-window-samples` |
-| Speed (sliding windows on events; default 0.2 s / 0.1 s step) | `--speed-window-s`, `--speed-step-s`, `--movement-threshold-deg-s` |
-| Speed plot smoothing only (not bouts) | `--speed-visual-smooth-s` (default 0.5 s MA; `0` off) |
-| Bout merging / validity | `--merge-gap-s`, `--min-valid-duration-s`, `--min-valid-events`, `--valid-mean-speed-deg-s` |
+| Voltage smoothing (before events) | `--smoothing moving_average\|savgol\|none`, `--smoothing-window-samples` |
+| Speed grid | `--speed-grid-hz` **`100`** or **`1000`** (bin width = 1 / Hz) |
+| Gaussian σ on **event rate** | `--sigma-analysis-s` (default **0.5** s; bouts & `speed_deg_s`), `--sigma-visualization-s` (default **1.0** s; `speed_deg_s_smooth_vis` & Fig 2) |
+| Movement threshold (on analysis speed) | `--movement-threshold-deg-s` (default **80**) |
+| Bout merging / validity | `--merge-gap-s` (default 2), `--min-valid-duration-s`, `--min-valid-events`, `--valid-mean-speed-deg-s` |
 | Micro-bout cutoffs | `--micro-max-duration-s`, `--micro-max-events` |
-| Wheel geometry | `--degrees-per-event` (default 18) |
+| Wheel geometry | `--degrees-per-event` (default **18**) |
 
-If **micro-bouts dominate** but you see long **0–5 V** oscillation blocks in the plots, try **increasing** `--merge-gap-s`, **widening** `--speed-window-s`, and **lowering** `--movement-threshold-deg-s` / `--valid-mean-speed-deg-s` slightly, then re-run.
+If **micro-bouts dominate** but you see long **0–5 V** oscillation blocks in the plots, try **increasing** `--merge-gap-s`, **increasing** `--sigma-analysis-s` / `--sigma-visualization-s`, and **lowering** `--movement-threshold-deg-s` / `--valid-mean-speed-deg-s` slightly, then re-run.
 
 ### Debug zoom (voltage + speed in a time range)
 
@@ -176,7 +194,7 @@ Example `epochs.json`:
 ### Outputs (in `--outdir`)
 
 - `bouts_summary.csv`: per-bout times, duration, event count, mean/peak speed, `type` (`valid` / `micro`)
-- `timeseries_speed.csv`: speed grid, `running_state`, `bout_id`, interpolated voltage
+- `timeseries_speed.csv`: one row per bin **center** (`timestamp_s`): **`speed_deg_s`** (σ_analysis), **`speed_deg_s_smooth_vis`** (σ_viz), **`speed_rev_s`**, **`event_count_per_bin`**, **`event_rate_per_s_raw`**, **`event_rate_per_s_gaussian_analysis`**, **`event_rate_per_s_gaussian_viz`**, **`running_state`**, **`bout_id`**, **`bout_type`**, **`voltage_interp`** (linear interp of raw voltage at bin centers)
 - `session_metrics.json`: engagement (valid bouts), speed stats (valid bouts only), micro summaries, config echo
 - `speed_distribution_valid.csv`: histogram of speeds inside valid bouts
 - `*_fig1_voltage_bouts.png` … `*_fig4_bout_hist.png`: QC figures
@@ -200,4 +218,3 @@ python -m src.analysis.analyze_treadmill_wheel --input src/rawdata/test_nosound.
 - DAQ adapter for direct `.dat` ingestion
 - Optional video/pose timestamp alignment hooks
 - Automated per-animal and cohort-level report generation
-# RythMice
