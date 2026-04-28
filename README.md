@@ -1,5 +1,7 @@
 # RythMice
 
+![Treadmill / wheel analyzer GUI – live QC (voltage, speed, event QC, bout histograms)](GUI_interface.png)
+
 Software and scripts for the mouse locomotion rhythm study described in:
 `Rhythm_Mouse_Locomotion_Proposal_v4-2.pdf`.
 
@@ -116,7 +118,7 @@ python -m src.analysis.analyze_treadmill_wheel --input path/to/recording.dat --o
 
 The treadmill / wheel analyzer GUI provides live QC: browse to a `.dat` file, adjust detection and bout parameters, then **Run analysis / refresh plots** to update the five-panel dashboard. Summary stats (events, valid/micro bouts, valid run time, mean/median speed) appear in the sidebar; use **Save full outputs to folder…** for the same exports as the CLI.
 
-![Treadmill / wheel analyzer GUI – live QC (voltage, speed, event QC, bout histograms)](GUI_interface.png)
+![Treadmill / wheel analyzer – controls, parameters, and plot layout](GUI_interface_2.png)
 
 From the repo root:
 
