@@ -1,12 +1,16 @@
 """
-Split tabular .dat recordings into N contiguous segments of equal duration in time.
+Split a ~36-minute rhythmic-stimulation ``.dat`` recording into eighteen 2-minute segments.
 
-Example: a 30-minute file ``001_0hz_1.dat`` with ``--parts 6`` yields six 5-minute files:
-``001_0hz_1_1.dat`` … ``001_0hz_1_6.dat``.
+Design (per session): twelve blocks ``[0, f1, 0, f2, …]`` where ``0`` is 4 minutes silence
+(split into two files: pre-silence then post-silence) and ``f1``, ``f2`` are ``2`` or ``7``
+meaning one 2-minute chunk at 2 Hz or 7 Hz. Silence files are tagged with the **upcoming**
+stimulus (e.g. ``001_presilence2hz_1`` / ``001_possilence2hz_1`` before the first 2 Hz epoch in
+session 1; ``001_presilence7hz_1`` before the first 7 Hz epoch). Session 1 uses
+``[0, 2, 0, 7, 0, 2, 0, 7, 0, 2, 0, 7]``; session 2 uses
+``[0, 7, 0, 2, 0, 7, 0, 2, 0, 7, 0, 2]``.
 
 Reading and time-scale rules match ``analyze_treadmill_wheel.load_data`` (sort, finite rows,
-duplicate timestamps dropped by default). Output preserves header vs headerless layout and
-all columns from the input table.
+duplicate timestamps dropped). Output preserves header vs headerless layout and all columns.
 """
 
 from __future__ import annotations
@@ -23,6 +27,67 @@ from src.analysis.analyze_treadmill_wheel import (
     _pick_column,
     _read_dat_table,
 )
+
+# Twelve condition codes per session: 0 = 4 min silence (two 2-min exports), 2 / 7 = one 2-min chunk.
+SESSION_PATTERN: dict[int, list[int]] = {
+    1: [0, 2, 0, 7, 0, 2, 0, 7, 0, 2, 0, 7],
+    2: [0, 7, 0, 2, 0, 7, 0, 2, 0, 7, 0, 2],
+}
+
+SEGMENT_DURATION_S = 120.0
+EXPECTED_TOTAL_S = 18 * SEGMENT_DURATION_S
+
+
+def _normalize_subject_id(subject_id: str) -> str:
+    s = subject_id.strip()
+    if s.isdigit():
+        return s.zfill(3)
+    return s
+
+
+def segment_stems_for_session(subject_id: str, session_id: int) -> list[str]:
+    """Return eighteen output stems (no suffix), e.g. ``001_presilence2hz_1``, ``001_2hz_1``."""
+    if session_id not in SESSION_PATTERN:
+        raise ValueError(f"session_id must be 1 or 2, got {session_id}")
+    sub = _normalize_subject_id(subject_id)
+    pattern = SESSION_PATTERN[session_id]
+    count_2hz = 0
+    count_7hz = 0
+    idx_pre_silence_2hz = 0
+    idx_pre_silence_7hz = 0
+    stems: list[str] = []
+    for i, code in enumerate(pattern):
+        if code == 0:
+            following: Optional[int] = None
+            for j in range(i + 1, len(pattern)):
+                if pattern[j] in (2, 7):
+                    following = pattern[j]
+                    break
+            if following is None:
+                raise ValueError(
+                    "Each silence block (0) must be followed by 2 or 7 later in the pattern."
+                )
+            if following == 2:
+                idx_pre_silence_2hz += 1
+                k = idx_pre_silence_2hz
+                hz_tag = "2hz"
+            else:
+                idx_pre_silence_7hz += 1
+                k = idx_pre_silence_7hz
+                hz_tag = "7hz"
+            stems.append(f"{sub}_presilence{hz_tag}_{k}")
+            stems.append(f"{sub}_possilence{hz_tag}_{k}")
+        elif code == 2:
+            count_2hz += 1
+            stems.append(f"{sub}_2hz_{count_2hz}")
+        elif code == 7:
+            count_7hz += 1
+            stems.append(f"{sub}_7hz_{count_7hz}")
+        else:
+            raise ValueError(f"Invalid pattern code {code!r} (expected 0, 2, or 7)")
+    if len(stems) != 18:
+        raise RuntimeError(f"Internal error: expected 18 stems, got {len(stems)}")
+    return stems
 
 
 def _sniff_headerless(path: Path) -> bool:
@@ -95,37 +160,33 @@ def _prepare_table(
     return df, t_col, ts_s, headerless
 
 
-def split_dat_file(
+def split_dat_rhythm_session(
     path: Path,
-    n_parts: int,
+    subject_id: str,
+    session_id: int,
     outdir: Optional[Path] = None,
     time_column: Optional[str] = None,
     voltage_column: Optional[str] = None,
     time_unit: Literal["auto", "s", "ms"] = "auto",
+    segment_seconds: float = SEGMENT_DURATION_S,
 ) -> list[Path]:
-    if n_parts < 2:
-        raise ValueError("n_parts must be at least 2")
-
+    """
+    Split one continuous recording into eighteen segments aligned from the first timestamp.
+    """
     df, _t_col, ts_s, headerless = _prepare_table(
         path, time_column, voltage_column, time_unit
     )
-
     t0 = float(ts_s[0])
-    t1 = float(ts_s[-1])
-    span = t1 - t0
-    if span <= 0:
-        raise ValueError(f"Non-positive time span in {path}")
-
-    edges = np.linspace(t0, t1, n_parts + 1)
+    t_end_data = float(ts_s[-1])
+    stems = segment_stems_for_session(subject_id, session_id)
     dest_dir = outdir if outdir is not None else path.parent
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = path.stem
     written: list[Path] = []
-    for i in range(n_parts):
-        left = float(edges[i])
-        right = float(edges[i + 1])
-        if i < n_parts - 1:
+    for i, stem in enumerate(stems):
+        left = t0 + i * segment_seconds
+        right = t0 + (i + 1) * segment_seconds
+        if i < len(stems) - 1:
             mask = (ts_s >= left) & (ts_s < right)
         else:
             mask = (ts_s >= left) & (ts_s <= right)
@@ -133,11 +194,10 @@ def split_dat_file(
         chunk = df.loc[mask].copy()
         if chunk.empty:
             raise ValueError(
-                f"Segment {i + 1}/{n_parts} of {path} has no samples "
+                f"Segment {i + 1}/{len(stems)} ({stem}) has no samples "
                 f"(window {left:.6g}–{right:.6g} s)."
             )
-
-        out_path = dest_dir / f"{stem}_{i + 1}{path.suffix}"
+        out_path = dest_dir / f"{stem}{path.suffix}"
         if headerless:
             chunk.to_csv(
                 out_path,
@@ -156,58 +216,41 @@ def split_dat_file(
             )
         written.append(out_path)
 
+    span = t_end_data - t0
+    if span < EXPECTED_TOTAL_S - 1.0:
+        raise ValueError(
+            f"Recording span ({span:.1f} s) is shorter than expected "
+            f"({EXPECTED_TOTAL_S:.0f} s for 18×{segment_seconds:.0f} s)."
+        )
     return written
 
 
-def _gather_inputs(files: list[Path], input_dir: Optional[Path], recursive: bool) -> list[Path]:
-    out: list[Path] = []
-    for p in files:
-        out.append(p.resolve())
-    if input_dir is not None:
-        root = input_dir.resolve()
-        pattern = "**/*.dat" if recursive else "*.dat"
-        out.extend(sorted(root.glob(pattern)))
-    seen: set[Path] = set()
-    uniq: list[Path] = []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Split .dat files into equal-time segments.")
-    p.add_argument(
-        "inputs",
-        nargs="*",
-        type=Path,
-        help="Input .dat files (optional if --input-dir is set)",
+    p = argparse.ArgumentParser(
+        description=(
+            "Split one ~36 min session .dat into eighteen 2 min files "
+            "(presilence2hz / possilence7hz / 2hz / 7hz, …) by subject and session."
+        )
     )
+    p.add_argument("subject_id", type=str, help="Subject id (e.g. 001); zero-padded if numeric")
     p.add_argument(
-        "--input-dir",
-        type=Path,
-        default=None,
-        help="Split every *.dat in this directory",
-    )
-    p.add_argument(
-        "--recursive",
-        action="store_true",
-        help="With --input-dir, search subfolders for *.dat",
-    )
-    p.add_argument(
-        "-n",
-        "--parts",
+        "session_id",
         type=int,
-        default=6,
-        metavar="N",
-        help="Number of equal-duration segments (default: 6)",
+        choices=(1, 2),
+        help="Session 1: [0,2,0,7,...]; session 2: [0,7,0,2,...]",
+    )
+    p.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Path to the full-session .dat file",
     )
     p.add_argument(
         "--outdir",
         type=Path,
         default=None,
-        help="Output directory (default: same folder as each input file)",
+        help="Output directory (default: same folder as input)",
     )
     p.add_argument("--time-column", type=str, default=None)
     p.add_argument("--signal-column", type=str, default=None)
@@ -219,36 +262,22 @@ def main() -> None:
     )
 
     args = p.parse_args()
-    if args.input_dir is not None:
-        idir = args.input_dir.resolve()
-        if not idir.is_dir():
-            p.error(f"--input-dir is not a directory or does not exist: {idir}")
+    path = args.input.resolve()
+    if not path.is_file():
+        raise SystemExit(f"Input is not a file: {path}")
 
-    inputs = _gather_inputs(list(args.inputs), args.input_dir, args.recursive)
-    if not inputs:
-        if args.input_dir is not None:
-            idir = args.input_dir.resolve()
-            hint = (
-                f"No .dat files matched in {idir}"
-                + (" (recursive)" if args.recursive else " (non-recursive; try --recursive)")
-                + "."
-            )
-            p.error(hint)
-        p.error("Provide one or more input .dat paths, or use --input-dir <folder>.")
-
-    for path in inputs:
-        if not path.is_file():
-            raise SystemExit(f"Not a file: {path}")
-        outs = split_dat_file(
-            path,
-            n_parts=args.parts,
-            outdir=args.outdir,
-            time_column=args.time_column,
-            voltage_column=args.signal_column,
-            time_unit=args.time_unit,  # type: ignore[arg-type]
-        )
-        rel = [o.name for o in outs]
-        print(f"{path.name} -> {', '.join(rel)}")
+    outs = split_dat_rhythm_session(
+        path,
+        subject_id=args.subject_id,
+        session_id=args.session_id,
+        outdir=args.outdir.resolve() if args.outdir else None,
+        time_column=args.time_column,
+        voltage_column=args.signal_column,
+        time_unit=args.time_unit,  # type: ignore[arg-type]
+    )
+    print(f"{path.name} -> {len(outs)} files")
+    for o in outs:
+        print(f"  {o.name}")
 
 
 if __name__ == "__main__":

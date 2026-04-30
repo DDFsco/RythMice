@@ -1,13 +1,15 @@
 """Aggregate treadmill wheel session_metrics under outputs/result and plot cohort comparisons.
 
 Expects folder names like ``{mouse_id}_{freq}hz_{replicate}`` (e.g. ``001_7hz_1``),
-or split segments ``{mouse_id}_{freq}hz_{replicate}_{segment}`` (e.g. ``001_7hz_1_3``).
+split segments ``{mouse_id}_{freq}hz_{replicate}_{segment}`` (e.g. ``001_7hz_1_3``),
+or rhythmic-session silence exports ``{mouse}_presilence{2hz|7hz}_{rep}`` /
+``{mouse}_possilence{2hz|7hz}_{rep}`` (logged as 0 Hz).
 Skips directories whose names start with ``test_``.
 
 Writes:
-  - ``cohort_sessions.csv`` — one row per session folder (incl. mean speed, valid run time,
-    and total distance = mean speed × valid run time, deg)
-  - ``cohort_paired_scatters.png`` — paired metrics (x vs y frequency conditions)
+  - ``cohort_sessions.csv`` — one row per session folder (incl. rhythm segment tags when parsed)
+  - ``cohort_paired_scatters.png`` — possilence vs 2 Hz, possilence vs 7 Hz, presilence vs possilence
+    (pre/post excludes replicate ``_1``); legacy layouts fall back to 0 vs 2 vs 7 Hz pairing
   - ``cohort_sound_vs_silence.png`` — distribution of metrics by frequency (0 Hz, 2 Hz, 7 Hz)
 """
 
@@ -26,6 +28,9 @@ import pandas as pd
 FOLDER_RE = re.compile(r"^(\d+)_(\d+)hz_(\d+)$")
 # Split recordings: same as above with an extra time-chunk index (from split_dat_segments).
 FOLDER_SPLIT_RE = re.compile(r"^(\d+)_(\d+)hz_(\d+)_(\d+)$")
+# Rhythm study: 4 min silence split into pre/post before the indicated upcoming Hz tag.
+SILENCE_PRE_RE = re.compile(r"^(\d+)_presilence(2hz|7hz)_(\d+)$")
+SILENCE_POST_RE = re.compile(r"^(\d+)_possilence(2hz|7hz)_(\d+)$")
 
 
 def _load_session_metrics(path: Path) -> Optional[dict[str, Any]]:
@@ -42,6 +47,7 @@ def _metrics_row(
     rep: int,
     data: dict[str, Any],
     segment: int,
+    rhythm_key: str = "",
 ) -> dict[str, Any]:
     eng = data.get("engagement") or {}
     spd = data.get("speed_valid_bouts_only") or {}
@@ -62,6 +68,7 @@ def _metrics_row(
         "frequency_hz": freq_hz,
         "replicate": rep,
         "segment": segment,
+        "rhythm_key": rhythm_key,
         "mean_speed_deg_s": mean_s,
         "total_running_time_valid_s": run_t,
         "total_distance_valid_deg": dist_deg,
@@ -77,20 +84,47 @@ def discover_sessions(result_root: Path) -> pd.DataFrame:
             continue
         if p.name.startswith("test_"):
             continue
+        mouse: str
+        freq_hz: int
+        rstr: str
+        segment: int
+        rhythm_key = ""
+
         m = FOLDER_SPLIT_RE.match(p.name)
         if m:
             mouse, fstr, rstr, sstr = m.group(1), m.group(2), m.group(3), m.group(4)
+            freq_hz = int(fstr)
             segment = int(sstr)
+            if freq_hz in (2, 7):
+                rhythm_key = f"tone_{freq_hz}"
+        elif (sm_pre := SILENCE_PRE_RE.match(p.name)):
+            hz_word = sm_pre.group(2)
+            mouse, rstr = sm_pre.group(1), sm_pre.group(3)
+            freq_hz = 0
+            segment = 1
+            h = 2 if hz_word == "2hz" else 7
+            rhythm_key = f"pre_{h}"
+        elif (sm_post := SILENCE_POST_RE.match(p.name)):
+            hz_word = sm_post.group(2)
+            mouse, rstr = sm_post.group(1), sm_post.group(3)
+            freq_hz = 0
+            segment = 2
+            h = 2 if hz_word == "2hz" else 7
+            rhythm_key = f"post_{h}"
         else:
             m = FOLDER_RE.match(p.name)
             if not m:
                 continue
             mouse, fstr, rstr = m.group(1), m.group(2), m.group(3)
+            freq_hz = int(fstr)
             segment = 1
+            if freq_hz in (2, 7):
+                rhythm_key = f"tone_{freq_hz}"
+
         data = _load_session_metrics(p / "session_metrics.json")
         if data is None:
             continue
-        rows.append(_metrics_row(p, mouse, int(fstr), int(rstr), data, segment))
+        rows.append(_metrics_row(p, mouse, freq_hz, int(rstr), data, segment, rhythm_key))
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
@@ -134,7 +168,160 @@ def _paired_points(
     return np.asarray(xs), np.asarray(ys), rep_labels, recording_repls
 
 
-def _plot_paired_grid(df: pd.DataFrame, out_path: Path) -> None:
+def _paired_by_rhythm_keys(
+    df: pd.DataFrame,
+    mouse: str,
+    key_x: str,
+    key_y: str,
+    metric: str,
+    *,
+    min_replicate: int = 1,
+) -> tuple[np.ndarray, np.ndarray, list[str], list[int]]:
+    """Match rows by ``rhythm_key`` and ``replicate`` (session index k from filenames)."""
+    sub = df[(df["mouse_id"] == mouse) & (df["rhythm_key"].isin([key_x, key_y]))]
+    if sub.empty:
+        return np.asarray([]), np.asarray([]), [], []
+
+    def metric_by_rep(key: str) -> pd.Series:
+        d = sub.loc[sub["rhythm_key"] == key, ["replicate", metric]].drop_duplicates(subset=["replicate"])
+        return d.set_index("replicate")[metric]
+
+    sx = metric_by_rep(key_x)
+    sy = metric_by_rep(key_y)
+    common = sx.index.intersection(sy.index)
+    common = common[common >= min_replicate]
+    xs, ys, labels, repls = [], [], [], []
+    for r in sorted(common.astype(int)):
+        vx, vy = sx.loc[r], sy.loc[r]
+        if vx is None or vy is None:
+            continue
+        try:
+            fx, fy = float(vx), float(vy)
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(fx) and np.isfinite(fy)):
+            continue
+        xs.append(fx)
+        ys.append(fy)
+        labels.append(str(r))
+        repls.append(int(r))
+    return np.asarray(xs), np.asarray(ys), labels, repls
+
+
+def _rhythm_palette(df: pd.DataFrame) -> dict[tuple[str, int], np.ndarray]:
+    pairs = df[["mouse_id", "replicate"]].drop_duplicates().sort_values(["mouse_id", "replicate"])
+    n_hues = max(len(pairs), 1)
+    palette = plt.cm.tab10(np.linspace(0, 0.9, n_hues))
+    color_by_mouse_rep: dict[tuple[str, int], np.ndarray] = {}
+    for idx, row in enumerate(pairs.itertuples(index=False)):
+        color_by_mouse_rep[(str(row.mouse_id), int(row.replicate))] = palette[idx % len(palette)]
+    return color_by_mouse_rep
+
+
+def _scatter_paired_rhythm(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    mice: list[str],
+    key_x: str,
+    key_y: str,
+    metric: str,
+    *,
+    min_replicate: int = 1,
+    color_by_mouse_rep: dict[tuple[str, int], np.ndarray],
+    x_label: str,
+    y_label: str,
+    title_metric: str,
+) -> None:
+    all_x: list[float] = []
+    all_y: list[float] = []
+    for mouse in mice:
+        x_arr, y_arr, _labels, recording_repls = _paired_by_rhythm_keys(
+            df, mouse, key_x, key_y, metric, min_replicate=min_replicate
+        )
+        if len(x_arr) == 0:
+            continue
+        for repl in sorted(set(recording_repls)):
+            m = np.array([r == repl for r in recording_repls], dtype=bool)
+            try:
+                c = color_by_mouse_rep[(mouse, repl)]
+            except KeyError:
+                c = plt.cm.tab10(0.5)
+            ax.scatter(
+                x_arr[m],
+                y_arr[m],
+                color=c,
+                s=55,
+                label=f"mouse {mouse} rep {repl}",
+                zorder=3,
+            )
+        all_x.extend(x_arr.tolist())
+        all_y.extend(y_arr.tolist())
+    if all_x and all_y:
+        lo = min(min(all_x), min(all_y))
+        hi = max(max(all_x), max(all_y))
+        pad = (hi - lo) * 0.05 if hi > lo else 1.0
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=0.8, alpha=0.5, zorder=1)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(f"{x_label} vs {y_label}\n{title_metric}")
+    ax.grid(True, alpha=0.25)
+
+
+def _scatter_pre_vs_post_combined(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    mice: list[str],
+    metric: str,
+    *,
+    min_replicate: int = 2,
+    title_metric: str,
+) -> None:
+    """Presilence vs possilence within the same 4 min silence block (rep index k), excluding k == 1."""
+    all_x: list[float] = []
+    all_y: list[float] = []
+    plotted_legend = {"2 Hz context": False, "7 Hz context": False}
+    colors_ctx = {"2 Hz context": "#1f77b4", "7 Hz context": "#ff7f0e"}
+    markers_ctx = {"2 Hz context": "o", "7 Hz context": "s"}
+    for ctx_keys, ctx_label in (
+        (("pre_2", "post_2"), "2 Hz context"),
+        (("pre_7", "post_7"), "7 Hz context"),
+    ):
+        kx, ky = ctx_keys
+        for mouse in mice:
+            x_arr, y_arr, _labels, recording_repls = _paired_by_rhythm_keys(
+                df, mouse, kx, ky, metric, min_replicate=min_replicate
+            )
+            if len(x_arr) == 0:
+                continue
+            kw = {
+                "c": colors_ctx[ctx_label],
+                "marker": markers_ctx[ctx_label],
+                "s": 55,
+                "zorder": 3,
+            }
+            if not plotted_legend[ctx_label]:
+                kw["label"] = f"pre vs post ({ctx_label}, rep≥{min_replicate})"
+                plotted_legend[ctx_label] = True
+            else:
+                kw["label"] = None
+            ax.scatter(x_arr, y_arr, edgecolors="k", linewidths=0.35, **kw)
+            all_x.extend(x_arr.tolist())
+            all_y.extend(y_arr.tolist())
+    if all_x and all_y:
+        lo = min(min(all_x), min(all_y))
+        hi = max(max(all_x), max(all_y))
+        pad = (hi - lo) * 0.05 if hi > lo else 1.0
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=0.8, alpha=0.5, zorder=1)
+    ax.set_xlabel("Presilence (first 2 min of silence)")
+    ax.set_ylabel("Possilence (second 2 min of silence)")
+    ax.set_title(
+        f"Presilence vs possilence (excl. first block per context)\n{title_metric}"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+
+
+def _plot_paired_grid_legacy(df: pd.DataFrame, out_path: Path) -> None:
     mice = sorted(df["mouse_id"].unique())
     comparisons = [(0, 7), (0, 2), (2, 7)]
     metrics = [
@@ -146,13 +333,7 @@ def _plot_paired_grid(df: pd.DataFrame, out_path: Path) -> None:
         ("total_running_time_valid_s", "Engagement: total valid running time (s)"),
     ]
     fig, axes = plt.subplots(len(comparisons), len(metrics), figsize=(12, 10), squeeze=False)
-
-    pairs = df[["mouse_id", "replicate"]].drop_duplicates().sort_values(["mouse_id", "replicate"])
-    n_hues = max(len(pairs), 1)
-    palette = plt.cm.tab10(np.linspace(0, 0.9, n_hues))
-    color_by_mouse_rep: dict[tuple[str, int], np.ndarray] = {}
-    for idx, row in enumerate(pairs.itertuples(index=False)):
-        color_by_mouse_rep[(str(row.mouse_id), int(row.replicate))] = palette[idx % len(palette)]
+    color_by_mouse_rep = _rhythm_palette(df)
 
     for i, (xh, yh) in enumerate(comparisons):
         for j, (mcol, mlabel) in enumerate(metrics):
@@ -205,6 +386,81 @@ def _plot_paired_grid(df: pd.DataFrame, out_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _plot_paired_grid_rhythm(df: pd.DataFrame, out_path: Path) -> None:
+    mice = sorted(df["mouse_id"].unique())
+    metrics = [
+        ("mean_speed_deg_s", "Mean speed (valid bouts, deg/s)"),
+        (
+            "total_distance_valid_deg",
+            "Total distance (valid bouts)\nmean speed × valid run time (deg)",
+        ),
+        ("total_running_time_valid_s", "Engagement: total valid running time (s)"),
+    ]
+    fig, axes = plt.subplots(3, len(metrics), figsize=(12, 11), squeeze=False)
+    color_by_mouse_rep = _rhythm_palette(df)
+
+    for j, (mcol, mlabel) in enumerate(metrics):
+        _scatter_paired_rhythm(
+            axes[0][j],
+            df,
+            mice,
+            "post_2",
+            "tone_2",
+            mcol,
+            min_replicate=1,
+            color_by_mouse_rep=color_by_mouse_rep,
+            x_label="Possilence (before 2 Hz)",
+            y_label="2 Hz tone",
+            title_metric=mlabel,
+        )
+        _scatter_paired_rhythm(
+            axes[1][j],
+            df,
+            mice,
+            "post_7",
+            "tone_7",
+            mcol,
+            min_replicate=1,
+            color_by_mouse_rep=color_by_mouse_rep,
+            x_label="Possilence (before 7 Hz)",
+            y_label="7 Hz tone",
+            title_metric=mlabel,
+        )
+        _scatter_pre_vs_post_combined(axes[2][j], df, mice, mcol, min_replicate=2, title_metric=mlabel)
+
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    if by_label:
+        fig.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="upper center",
+            ncol=min(len(by_label), 4),
+            bbox_to_anchor=(0.5, 1.02),
+        )
+    fig.suptitle(
+        "Rhythm cohort: possilence vs tone; presilence vs possilence (replicate ≥ 2)",
+        fontsize=12,
+        y=1.05,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_paired_grid(df: pd.DataFrame, out_path: Path) -> None:
+    if df.empty:
+        return
+    use_rhythm = "rhythm_key" in df.columns and df["rhythm_key"].astype(str).str.match(r"^(pre_|post_|tone_)").any()
+    if use_rhythm:
+        need = {"post_2", "tone_2", "post_7", "tone_7", "pre_2", "pre_7"}
+        tags = set(df["rhythm_key"].astype(str).unique())
+        if need.issubset(tags):
+            _plot_paired_grid_rhythm(df, out_path)
+            return
+    _plot_paired_grid_legacy(df, out_path)
 
 
 def _plot_sound_vs_silence(df: pd.DataFrame, out_path: Path) -> None:
